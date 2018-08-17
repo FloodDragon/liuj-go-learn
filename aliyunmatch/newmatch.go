@@ -226,12 +226,13 @@ func (StepOneOutKV) TableName() string {
 	return "tianchi_fresh_comp_train_kv_step_one"
 }
 
+type Result struct {
+	UserId       int64 `gorm:"column:user_id"`
+	ItemId       int64 `gorm:"column:item_id"`
+	BehaviorType int64 `gorm:"column:behavior_type"`
+}
+
 func StepOne() {
-	type Result struct {
-		UserId       int64 `gorm:"column:user_id"`
-		ItemId       int64 `gorm:"column:item_id"`
-		BehaviorType int64 `gorm:"column:behavior_type"`
-	}
 	Tx := Gdb.Begin()
 	defer Tx.Commit()
 
@@ -295,15 +296,34 @@ func StepOne() {
 }
 
 //================================================================ Step 2 ================================================================
-func StepTwo() {
 
+type StepTwoOutKV struct {
+	Key   string `gorm:"column:key"`
+	Value int64  `gorm:"column:value"`
+}
+
+func (StepTwoOutKV) TableName() string {
+	return "tianchi_fresh_comp_train_kv_step_two"
+}
+
+func StepTwo() {
+	Tx := Gdb.Begin()
+	defer Tx.Commit()
+	if userIdNumbers == nil {
+		var userIds []Result
+		Tx.Raw("SELECT user_id FROM tianchi_fresh_comp_train_user GROUP BY user_id").Scan(&userIds)
+		if len(userIds) > 0 {
+			userIdNumbers = make([]int64, len(userIds))
+			for _, uId := range userIds {
+				userIdNumbers = append(userIdNumbers, uId.UserId)
+			}
+		}
+	}
 	if len(userIdNumbers) > 0 {
-		Tx := Gdb.Begin()
-		defer Tx.Commit()
-		var itemCountMap map[string]int64
+		//var itemCountMap map[string]int64
 		for _, uId := range userIdNumbers {
 			var result []StepOneOutKV
-			Tx.Raw("select key, value from tianchi_fresh_comp_train_kv_step_one where key = ?", uId).Scan(&result)
+			Tx.Raw("select * from tianchi_fresh_comp_train_kv_step_one where 'key' = ?", uId).Scan(&result)
 			if len(result) > 0 {
 				for _, rs := range result {
 					itemIds := rs.Value
@@ -314,18 +334,15 @@ func StepTwo() {
 						for j := 0; j < len; j++ {
 							other := itemArr[j]
 							assemble := item + ":" + other
-							data,exist := itemCountMap[assemble]
-							if exist {
-								data++
-								itemCountMap[assemble] = data
-							}else {
-								itemCountMap[assemble] = 1
+							err := Tx.Create(StepTwoOutKV{Key: assemble, Value: 1}).Error
+							if err != nil {
+								panic(err)
 							}
-
 						}
 					}
 				}
 			}
 		}
+
 	}
 }
