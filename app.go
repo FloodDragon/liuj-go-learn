@@ -22,8 +22,25 @@ func (de *DivideError) Error() string {
 	return fmt.Sprintf(strFormat, de.dividee)
 }
 
+func ProduceFinalizedGarbage() {
+	x := &Garbage{}
+	runtime.SetFinalizer(x, notify)
+}
+
+type Garbage struct{ a int }
+
+func notify(f *Garbage) {
+	stats := &runtime.MemStats{}
+	runtime.ReadMemStats(stats)
+	fmt.Printf("堆的使用信息  %d,%d,%d,%d \n", stats.HeapSys, stats.HeapAlloc,
+		stats.HeapIdle, stats.HeapReleased)
+	go ProduceFinalizedGarbage()
+}
+
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
+	go ProduceFinalizedGarbage()
+
 	//操作mysql
 	//mysql.TestMysql()
 
@@ -36,7 +53,6 @@ func main() {
 
 	//步骤二
 	aliyunmatch.StepTwo()
-
 	aliyunmatch.CloseDb()
 
 }

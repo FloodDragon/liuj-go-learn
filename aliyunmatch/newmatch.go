@@ -14,6 +14,7 @@ import (
 	"github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/mysql"
 	"strconv"
+	"runtime"
 )
 
 var Db *sqlx.DB
@@ -297,52 +298,112 @@ func StepOne() {
 
 //================================================================ Step 2 ================================================================
 
-type StepTwoOutKV struct {
+type StepTwoPointOneOutKV struct {
 	Key   string `gorm:"column:key"`
 	Value int64  `gorm:"column:value"`
 }
 
-func (StepTwoOutKV) TableName() string {
-	return "tianchi_fresh_comp_train_kv_step_two"
+func (StepTwoPointOneOutKV) TableName() string {
+	return "tianchi_fresh_comp_train_kv_step_two_point_one"
+}
+
+type StepTwoPointTwoOutKV struct {
+	Key   string `gorm:"column:key"`
+	Value int64  `gorm:"column:value"`
+}
+
+func (StepTwoPointTwoOutKV) TableName() string {
+	return "tianchi_fresh_comp_train_kv_step_two_point_two"
 }
 
 func StepTwo() {
-	Tx := Gdb.Begin()
-	defer Tx.Commit()
+	//step 2-1
 	if userIdNumbers == nil {
+		Tx := Gdb.Begin()
 		var userIds []Result
 		Tx.Raw("SELECT user_id FROM tianchi_fresh_comp_train_user GROUP BY user_id").Scan(&userIds)
-		if len(userIds) > 0 {
-			userIdNumbers = make([]int64, len(userIds))
+		userIdsLen := len(userIds)
+		if userIdsLen > 0 {
 			for _, uId := range userIds {
 				userIdNumbers = append(userIdNumbers, uId.UserId)
 			}
 		}
+		Tx.Commit()
 	}
-	if len(userIdNumbers) > 0 {
-		//var itemCountMap map[string]int64
+
+	totalUserNumLen := len(userIdNumbers)
+	if totalUserNumLen > 0 {
+		txCount := 50
+		semaphore := make(chan int, txCount)
+		stepTwoPointOneInToDbTotal := 0
+		eachTxUserNum := totalUserNumLen / txCount
+		userInc := 0
+		var userGoExecList []int64
+		userGoExecCount := 0
 		for _, uId := range userIdNumbers {
-			var result []StepOneOutKV
-			Tx.Raw("select * from tianchi_fresh_comp_train_kv_step_one where 'key' = ?", uId).Scan(&result)
-			if len(result) > 0 {
-				for _, rs := range result {
-					itemIds := rs.Value
-					itemArr := strings.Split(itemIds, ",")
-					len := len(itemArr)
-					for i := 0; i < len; i++ {
-						item := itemArr[i]
-						for j := 0; j < len; j++ {
-							other := itemArr[j]
-							assemble := item + ":" + other
-							err := Tx.Create(StepTwoOutKV{Key: assemble, Value: 1}).Error
-							if err != nil {
-								panic(err)
+			userInc++
+			userGoExecList = append(userGoExecList, uId)
+			if userInc >= eachTxUserNum {
+				go func(userGoExecList []int64, semaphore chan<- int) {
+					stepTwoPointOneInToDbCount := 0
+					goTx := Gdb.Begin()
+					for _, uId := range userGoExecList {
+						var result StepOneOutKV
+						err := goTx.Raw("select * from tianchi_fresh_comp_train_kv_step_one where `key` = ?", strconv.FormatInt(uId, 10)).Find(&result).Error
+						if err != nil {
+							panic(err)
+						} else {
+							if len(result.Value) > 0 && len(result.Key) > 0 {
+								itemIds := result.Value
+								itemArr := strings.Split(itemIds, ",")
+								len := len(itemArr)
+								for i := 0; i < len; i++ {
+									item := itemArr[i]
+									for j := 0; j < len; j++ {
+										other := itemArr[j]
+										assemble := strings.Split(item, ":")[0] + ":" + strings.Split(other, ":")[0]
+										err := goTx.Create(StepTwoPointOneOutKV{Key: assemble, Value: 1}).Error
+										if err != nil {
+											panic(err)
+										} else {
+ 											stepTwoPointOneInToDbCount++
+											//fmt.Printf("step 2-1 入库 tianchi_fresh_comp_train_kv_step_two_point_one 正在执行中 %d \n", stepTwoPointOneInToDbCount)
+										}
+									}
+								}
 							}
 						}
 					}
-				}
+					fmt.Printf("step 2-1 入库 tianchi_fresh_comp_train_kv_step_two_point_one 增量 %d  \n", stepTwoPointOneInToDbCount)
+					goTx.Commit()
+					semaphore <- stepTwoPointOneInToDbCount
+					runtime.GC()
+				}(userGoExecList, semaphore)
+				userGoExecCount++
+				userInc = 0
+				userGoExecList = nil
+			}
+		}
+		//var itemCountMap map[string]int64
+		completeCount := 0
+	loop:
+		for ; ; {
+			v, _ := <-semaphore
+			completeCount++
+			stepTwoPointOneInToDbTotal += v
+			fmt.Printf("step 2-1 入库 tianchi_fresh_comp_train_kv_step_two_point_one 总量 %d  \n", stepTwoPointOneInToDbTotal)
+			runtime.GC()
+			if completeCount >= userGoExecCount {
+				break loop
 			}
 		}
 
+		fmt.Println("step 2-1 入库 tianchi_fresh_comp_train_kv_step_two_point_one 完成", )
+
+		//step 2-2
+		Tx := Gdb.Begin()
+		Tx.Raw("INSERT INTO tianchi_fresh_comp_train_kv_step_two_point_two (`key`, `value`) SELECT `key` , SUM(`value`) FROM  tianchi_fresh_comp_train_kv_step_two_point_one GROUP BY `key`")
+		Tx.Commit()
+		fmt.Println("step 2-2 入库 tianchi_fresh_comp_train_kv_step_two_point_two 完成", )
 	}
 }
