@@ -20,6 +20,7 @@ import (
 	"encoding/hex"
 	"crypto/rand"
 	"encoding/base64"
+	"sync"
 )
 
 var Db *sqlx.DB
@@ -248,6 +249,8 @@ type Result struct {
 }
 
 func StepOne() {
+	fmt.Println("===============================  step 1 计算入库开始 -> levedb  ===============================")
+
 	Tx := Gdb.Begin()
 	defer Tx.Commit()
 
@@ -300,7 +303,7 @@ func StepOne() {
 							panic(err)
 						} else {
 							inToDbCount++
-							fmt.Printf("入库成功userId=%s  |  value=%s \n", currentKey, currentValue)
+							fmt.Printf("入库成功 key = {%s}  |  value = {%s} \n", currentKey, currentValue)
 						}
 						/* leveldb代替mysql
 						err := Tx.Create(StepOneOutKV{Key: currentKey, Value: currentValue}).Error
@@ -315,7 +318,7 @@ func StepOne() {
 				}
 			}
 		}
-		fmt.Printf("step 1 入库 tianchi_fresh_comp_train_kv_step_one 总量 %d", inToDbCount)
+		fmt.Printf("===============================  step 1 计算入库完成 -> levedb 总量 %d  ===============================\n", inToDbCount)
 	}
 }
 
@@ -340,6 +343,7 @@ func (StepTwoPointTwoOutKV) TableName() string {
 }
 
 func StepTwo() {
+	fmt.Println("===============================  step 2 计算入库开始 -> levedb  ===============================")
 	//step 2-1
 	if userIdNumbers == nil {
 		Tx := Gdb.Begin()
@@ -356,7 +360,8 @@ func StepTwo() {
 
 	totalUserNumLen := len(userIdNumbers)
 	if totalUserNumLen > 0 {
-		txCount := 50
+		var lock = new(sync.Mutex)
+		txCount := 5000
 		semaphore := make(chan int, txCount)
 		stepTwoPointOneInToDbTotal := 0
 		eachTxUserNum := totalUserNumLen / txCount
@@ -367,8 +372,9 @@ func StepTwo() {
 			userInc++
 			userGoExecList = append(userGoExecList, uId)
 			if userInc%eachTxUserNum == 0 {
-				go func(userGoExecList []int64, semaphore chan<- int) {
-					buffCount := 0
+				go func(userGoExecList []int64, semaphore chan<- int, lock *sync.Mutex) {
+					uniqueId := UniqueId()
+					//buffCount := 0
 					stepTwoPointOneInToDbCount := 0
 					//goTx := Gdb.Begin()
 					for _, uId := range userGoExecList {
@@ -396,10 +402,22 @@ func StepTwo() {
 								for j := 0; j < len; j++ {
 									other := itemArr[j]
 									assemble := strings.Split(item, ":")[0] + ":" + strings.Split(other, ":")[0]
+									lock.Lock()
 									exist, _ := LevelDb.Has([]byte(assemble), nil)
 									if exist {
+										v, _ := LevelDb.Get([]byte(assemble), nil)
+										value, _ := strconv.Atoi(string(v))
+										value++
+										error := LevelDb.Put([]byte(assemble), []byte(strconv.Itoa(value)), nil)
+										if error != nil {
+											panic(error)
+										}
+									} else {
+										LevelDb.Put([]byte(assemble), []byte(strconv.Itoa(1)), nil)
 									}
-									buffCount++
+									lock.Unlock()
+									stepTwoPointOneInToDbCount++
+									fmt.Printf("step 2-1 协程id = {%s} 正在执行入库 key = {%s} \n", uniqueId, assemble)
 								}
 								/*
 								insertSql := buff.String()
@@ -422,7 +440,7 @@ func StepTwo() {
 					//goTx.Commit()
 					semaphore <- stepTwoPointOneInToDbCount
 					runtime.GC()
-				}(userGoExecList, semaphore)
+				}(userGoExecList, semaphore, lock)
 				userGoExecCount++
 				//userInc = 0
 				userGoExecList = nil
@@ -450,6 +468,7 @@ func StepTwo() {
 		Tx.Commit()
 		fmt.Println("step 2-2 入库 tianchi_fresh_comp_train_kv_step_two_point_two 完成", )
 	}
+	fmt.Println("===============================  step 2 计算入库完成 -> levedb  ===============================")
 }
 
 //生成32位md5字串
