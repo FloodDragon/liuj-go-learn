@@ -15,10 +15,16 @@ import (
 	_ "github.com/jinzhu/gorm/dialects/mysql"
 	"strconv"
 	"runtime"
+	"github.com/syndtr/goleveldb/leveldb"
+	"crypto/md5"
+	"encoding/hex"
+	"crypto/rand"
+	"encoding/base64"
 )
 
 var Db *sqlx.DB
 var Gdb *gorm.DB
+var LevelDb *leveldb.DB
 
 func init() {
 	database, err := sqlx.Open("mysql", "root:123456@tcp(127.0.0.1:3306)/match?charset=utf8")
@@ -29,17 +35,25 @@ func init() {
 	Db = database
 
 	gormDb, err := gorm.Open("mysql", "root:123456@tcp(127.0.0.1:3306)/match?charset=utf8")
-	Gdb = gormDb
-
 	if err != nil {
 		fmt.Println("open gorm mysql failed,", err)
 		return
 	}
+	Gdb = gormDb
+
+	lDb, err := leveldb.OpenFile("/home/liuj-ai/LevelDB/alimatch/matchdata", nil)
+	if err != nil {
+		fmt.Println("open level db failed,", err)
+		return
+	}
+	LevelDb = lDb
+
 }
 
 func CloseDb() {
 	defer Db.Close()
 	defer Gdb.Close()
+	defer LevelDb.Close()
 }
 
 func checkErr(errMasg error) {
@@ -281,6 +295,14 @@ func StepOne() {
 					currentValue = buf.String()
 
 					if len(currentKey) > 0 && len(currentValue) > 0 {
+						err := LevelDb.Put([]byte(currentKey), []byte(currentValue), nil)
+						if err != nil {
+							panic(err)
+						} else {
+							inToDbCount++
+							fmt.Printf("入库成功userId=%s  |  value=%s \n", currentKey, currentValue)
+						}
+						/* leveldb代替mysql
 						err := Tx.Create(StepOneOutKV{Key: currentKey, Value: currentValue}).Error
 						if err != nil {
 							panic(err)
@@ -288,6 +310,7 @@ func StepOne() {
 							inToDbCount++
 							fmt.Printf("入库成功userId=%s  |  value=%s \n", currentKey, currentValue)
 						}
+						*/
 					}
 				}
 			}
@@ -343,51 +366,72 @@ func StepTwo() {
 		for _, uId := range userIdNumbers {
 			userInc++
 			userGoExecList = append(userGoExecList, uId)
-			if userInc >= eachTxUserNum {
+			if userInc%eachTxUserNum == 0 {
 				go func(userGoExecList []int64, semaphore chan<- int) {
+					buffCount := 0
 					stepTwoPointOneInToDbCount := 0
-					goTx := Gdb.Begin()
+					//goTx := Gdb.Begin()
 					for _, uId := range userGoExecList {
-						var result StepOneOutKV
-						err := goTx.Raw("select * from tianchi_fresh_comp_train_kv_step_one where `key` = ?", strconv.FormatInt(uId, 10)).Find(&result).Error
-						if err != nil {
-							panic(err)
+						key := strconv.FormatInt(uId, 10)
+						var result *StepOneOutKV
+						exist, error := LevelDb.Has([]byte(key), nil)
+						if error != nil {
+							panic(error)
 						} else {
-							if len(result.Value) > 0 && len(result.Key) > 0 {
-								itemIds := result.Value
-								itemArr := strings.Split(itemIds, ",")
-								len := len(itemArr)
-								for i := 0; i < len; i++ {
-									item := itemArr[i]
-									for j := 0; j < len; j++ {
-										other := itemArr[j]
-										assemble := strings.Split(item, ":")[0] + ":" + strings.Split(other, ":")[0]
-										err := goTx.Create(StepTwoPointOneOutKV{Key: assemble, Value: 1}).Error
-										if err != nil {
-											panic(err)
-										} else {
- 											stepTwoPointOneInToDbCount++
-											//fmt.Printf("step 2-1 入库 tianchi_fresh_comp_train_kv_step_two_point_one 正在执行中 %d \n", stepTwoPointOneInToDbCount)
-										}
-									}
+							if exist {
+								value, err := LevelDb.Get([]byte(key), nil)
+								if err != nil {
+									panic(error)
+								} else {
+									result = &StepOneOutKV{Key: key, Value: string(value)}
 								}
 							}
 						}
+						if result != nil && len(result.Value) > 0 && len(result.Key) > 0 {
+							itemIds := result.Value
+							itemArr := strings.Split(itemIds, ",")
+							len := len(itemArr)
+							for i := 0; i < len; i++ {
+								item := itemArr[i]
+								for j := 0; j < len; j++ {
+									other := itemArr[j]
+									assemble := strings.Split(item, ":")[0] + ":" + strings.Split(other, ":")[0]
+									exist, _ := LevelDb.Has([]byte(assemble), nil)
+									if exist {
+									}
+									buffCount++
+								}
+								/*
+								insertSql := buff.String()
+								fmt.Printf("step 2-1 入库 tianchi_fresh_comp_train_kv_step_two_point_one 正在执行中 sql = %s \n", insertSql)
+								err := goTx.Exec(insertSql).Error
+								//err := goTx.Create(StepTwoPointOneOutKV{Key: assemble, Value: 1}).Error
+								if err != nil {
+									panic(err)
+								} else {
+									stepTwoPointOneInToDbCount += buffCount
+								}
+								buffCount = 0
+								buff.Reset()
+								buff.WriteString("insert into `tianchi_fresh_comp_train_kv_step_two_point_one` (`key`, `value`) values ")
+								*/
+							}
+						}
 					}
-					fmt.Printf("step 2-1 入库 tianchi_fresh_comp_train_kv_step_two_point_one 增量 %d  \n", stepTwoPointOneInToDbCount)
-					goTx.Commit()
+					fmt.Printf("===============================  step 2-1 入库 tianchi_fresh_comp_train_kv_step_two_point_one 增量 %d  ===============================\n", stepTwoPointOneInToDbCount)
+					//goTx.Commit()
 					semaphore <- stepTwoPointOneInToDbCount
 					runtime.GC()
 				}(userGoExecList, semaphore)
 				userGoExecCount++
-				userInc = 0
+				//userInc = 0
 				userGoExecList = nil
 			}
 		}
 		//var itemCountMap map[string]int64
 		completeCount := 0
 	loop:
-		for ; ; {
+		for {
 			v, _ := <-semaphore
 			completeCount++
 			stepTwoPointOneInToDbTotal += v
@@ -406,4 +450,20 @@ func StepTwo() {
 		Tx.Commit()
 		fmt.Println("step 2-2 入库 tianchi_fresh_comp_train_kv_step_two_point_two 完成", )
 	}
+}
+
+//生成32位md5字串
+func GetMd5String(s string) string {
+	h := md5.New()
+	h.Write([]byte(s))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+//生成Guid字串
+func UniqueId() string {
+	b := make([]byte, 48)
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
+		return ""
+	}
+	return GetMd5String(base64.URLEncoding.EncodeToString(b))
 }

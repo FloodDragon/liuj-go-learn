@@ -39,7 +39,7 @@ func notify(f *Garbage) {
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
-	go ProduceFinalizedGarbage()
+	//go ProduceFinalizedGarbage()
 
 	//操作mysql
 	//mysql.TestMysql()
@@ -52,7 +52,6 @@ func main() {
 	//aliyunmatch.StepOne()
 
 	//步骤二
-	aliyunmatch.StepTwo()
+	//aliyunmatch.StepTwo()
 	aliyunmatch.CloseDb()
-
 }
