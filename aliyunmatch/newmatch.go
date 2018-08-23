@@ -20,12 +20,12 @@ import (
 	"encoding/hex"
 	"crypto/rand"
 	"encoding/base64"
-	"sync"
 )
 
 var Db *sqlx.DB
 var Gdb *gorm.DB
-var LevelDb *leveldb.DB
+
+const LevelDBPath = "C:\\Users\\liuj-ai\\LeveDB\\match\\"
 
 func init() {
 	database, err := sqlx.Open("mysql", "root:123456@tcp(127.0.0.1:3306)/match?charset=utf8")
@@ -41,20 +41,13 @@ func init() {
 		return
 	}
 	Gdb = gormDb
-
-	lDb, err := leveldb.OpenFile("/home/liuj-ai/LevelDB/alimatch/matchdata", nil)
-	if err != nil {
-		fmt.Println("open level db failed,", err)
-		return
-	}
-	LevelDb = lDb
-
 }
 
 func CloseDb() {
 	defer Db.Close()
 	defer Gdb.Close()
-	defer LevelDb.Close()
+	defer StepOneDataDb.Close()
+	defer StepTwoPointOneDataDb.Close()
 }
 
 func checkErr(errMasg error) {
@@ -248,6 +241,8 @@ type Result struct {
 	BehaviorType int64 `gorm:"column:behavior_type"`
 }
 
+var StepOneDataDb *leveldb.DB
+
 func StepOne() {
 	fmt.Println("===============================  step 1 计算入库开始 -> levedb  ===============================")
 
@@ -257,6 +252,15 @@ func StepOne() {
 	var userIds []Result
 	Tx.Raw("SELECT user_id FROM tianchi_fresh_comp_train_user GROUP BY user_id").Scan(&userIds)
 	inToDbCount := 0
+
+	fileName := LevelDBPath + "StepOneData"
+	var err error
+	StepOneDataDb, err = leveldb.OpenFile(fileName, nil)
+	if err != nil {
+		fmt.Printf("open level db failed step 1 fileName = {%s}err = {%s} \n", fileName, err)
+		return
+	}
+
 	if len(userIds) > 0 {
 		for _, uId := range userIds {
 			var result []Result
@@ -298,7 +302,7 @@ func StepOne() {
 					currentValue = buf.String()
 
 					if len(currentKey) > 0 && len(currentValue) > 0 {
-						err := LevelDb.Put([]byte(currentKey), []byte(currentValue), nil)
+						err := StepOneDataDb.Put([]byte(currentKey), []byte(currentValue), nil)
 						if err != nil {
 							panic(err)
 						} else {
@@ -318,6 +322,7 @@ func StepOne() {
 				}
 			}
 		}
+
 		fmt.Printf("===============================  step 1 计算入库完成 -> levedb 总量 %d  ===============================\n", inToDbCount)
 	}
 }
@@ -342,6 +347,61 @@ func (StepTwoPointTwoOutKV) TableName() string {
 	return "tianchi_fresh_comp_train_kv_step_two_point_two"
 }
 
+var StepTwoPointOneDataDb *leveldb.DB
+
+func assemble(semaphore chan<- int, uId int64, index int) {
+	uniqueId := UniqueId()
+	stepTwoPointOneInToDbCount := 0
+	key := strconv.FormatInt(uId, 10)
+
+	//读取StepOne结果集
+	var result *StepOneOutKV
+	exist, error := StepOneDataDb.Has([]byte(key), nil)
+	if error != nil {
+		panic(error)
+	} else {
+		if exist {
+			value, err := StepOneDataDb.Get([]byte(key), nil)
+			if err != nil {
+				panic(error)
+			} else {
+				result = &StepOneOutKV{Key: key, Value: string(value)}
+			}
+		}
+	}
+	//商品Item组合入库
+	if result != nil && len(result.Value) > 0 && len(result.Key) > 0 {
+		itemIds := result.Value
+		itemArr := strings.Split(itemIds, ",")
+		len := len(itemArr)
+		for i := 0; i < len; i++ {
+			item := itemArr[i]
+			for j := 0; j < len; j++ {
+				other := itemArr[j]
+				assemble := strings.Split(item, ":")[0] + ":" + strings.Split(other, ":")[0]
+				exist, _ := StepTwoPointOneDataDb.Has([]byte(assemble), nil)
+				if exist {
+					v, _ := StepTwoPointOneDataDb.Get([]byte(assemble), nil)
+					value, _ := strconv.Atoi(string(v))
+					value++
+					error := StepTwoPointOneDataDb.Put([]byte(assemble), []byte(strconv.Itoa(value)), nil)
+					if error != nil {
+						panic(error)
+					}
+				} else {
+					StepTwoPointOneDataDb.Put([]byte(assemble), []byte(strconv.Itoa(1)), nil)
+				}
+				stepTwoPointOneInToDbCount++
+				fmt.Printf("step 2-1 协程id = {%s} 正在执行入库 key = {%s}  已执行次数 count ={%d}  正在执行第{%d}位的用户{%s} \n", uniqueId, assemble, stepTwoPointOneInToDbCount, index, key)
+			}
+		}
+	}
+	fmt.Printf("===============================  step 2-1 入库 tianchi_fresh_comp_train_kv_step_two_point_one 增量 %d  ===============================\n", stepTwoPointOneInToDbCount)
+	//goTx.Commit()
+	semaphore <- stepTwoPointOneInToDbCount
+	runtime.GC()
+}
+
 func StepTwo() {
 	fmt.Println("===============================  step 2 计算入库开始 -> levedb  ===============================")
 	//step 2-1
@@ -358,115 +418,47 @@ func StepTwo() {
 		Tx.Commit()
 	}
 
+	//打开step 1 结果集
+	if StepOneDataDb == nil {
+		fileName := LevelDBPath + "StepOneData"
+		var err error
+		StepOneDataDb, err = leveldb.OpenFile(fileName, nil)
+		if err != nil {
+			fmt.Printf("open level db failed step 1 fileName = {%s}err = {%s} \n", fileName, err)
+			return
+		}
+	}
+
+	fileName := LevelDBPath + "StepTwoPointOneData"
+	var err error
+	StepTwoPointOneDataDb, err = leveldb.OpenFile(fileName, nil)
+	if err != nil {
+		fmt.Printf("open level db failed step 2-1 fileName = {%s}  err = {%s} \n", fileName, err)
+		return
+	}
+
 	totalUserNumLen := len(userIdNumbers)
 	if totalUserNumLen > 0 {
-		var lock = new(sync.Mutex)
-		txCount := 5000
-		semaphore := make(chan int, txCount)
+		semaphore := make(chan int, totalUserNumLen)
 		stepTwoPointOneInToDbTotal := 0
-		eachTxUserNum := totalUserNumLen / txCount
-		userInc := 0
-		var userGoExecList []int64
 		userGoExecCount := 0
-		for _, uId := range userIdNumbers {
-			userInc++
-			userGoExecList = append(userGoExecList, uId)
-			if userInc%eachTxUserNum == 0 {
-				go func(userGoExecList []int64, semaphore chan<- int, lock *sync.Mutex) {
-					uniqueId := UniqueId()
-					//buffCount := 0
-					stepTwoPointOneInToDbCount := 0
-					//goTx := Gdb.Begin()
-					for _, uId := range userGoExecList {
-						key := strconv.FormatInt(uId, 10)
-						var result *StepOneOutKV
-						exist, error := LevelDb.Has([]byte(key), nil)
-						if error != nil {
-							panic(error)
-						} else {
-							if exist {
-								value, err := LevelDb.Get([]byte(key), nil)
-								if err != nil {
-									panic(error)
-								} else {
-									result = &StepOneOutKV{Key: key, Value: string(value)}
-								}
-							}
-						}
-						if result != nil && len(result.Value) > 0 && len(result.Key) > 0 {
-							itemIds := result.Value
-							itemArr := strings.Split(itemIds, ",")
-							len := len(itemArr)
-							for i := 0; i < len; i++ {
-								item := itemArr[i]
-								for j := 0; j < len; j++ {
-									other := itemArr[j]
-									assemble := strings.Split(item, ":")[0] + ":" + strings.Split(other, ":")[0]
-									lock.Lock()
-									exist, _ := LevelDb.Has([]byte(assemble), nil)
-									if exist {
-										v, _ := LevelDb.Get([]byte(assemble), nil)
-										value, _ := strconv.Atoi(string(v))
-										value++
-										error := LevelDb.Put([]byte(assemble), []byte(strconv.Itoa(value)), nil)
-										if error != nil {
-											panic(error)
-										}
-									} else {
-										LevelDb.Put([]byte(assemble), []byte(strconv.Itoa(1)), nil)
-									}
-									lock.Unlock()
-									stepTwoPointOneInToDbCount++
-									fmt.Printf("step 2-1 协程id = {%s} 正在执行入库 key = {%s} \n", uniqueId, assemble)
-								}
-								/*
-								insertSql := buff.String()
-								fmt.Printf("step 2-1 入库 tianchi_fresh_comp_train_kv_step_two_point_one 正在执行中 sql = %s \n", insertSql)
-								err := goTx.Exec(insertSql).Error
-								//err := goTx.Create(StepTwoPointOneOutKV{Key: assemble, Value: 1}).Error
-								if err != nil {
-									panic(err)
-								} else {
-									stepTwoPointOneInToDbCount += buffCount
-								}
-								buffCount = 0
-								buff.Reset()
-								buff.WriteString("insert into `tianchi_fresh_comp_train_kv_step_two_point_one` (`key`, `value`) values ")
-								*/
-							}
-						}
+		for index, uId := range userIdNumbers {
+			go assemble(semaphore, uId, index)
+			userGoExecCount++
+			if userGoExecCount == 1 {
+				for {
+					v, _ := <-semaphore
+					userGoExecCount--
+					stepTwoPointOneInToDbTotal += v
+					if userGoExecCount == 0 {
+						fmt.Printf("step 2-1 入库增量 %d  \n", stepTwoPointOneInToDbTotal)
+						runtime.GC()
+						break
 					}
-					fmt.Printf("===============================  step 2-1 入库 tianchi_fresh_comp_train_kv_step_two_point_one 增量 %d  ===============================\n", stepTwoPointOneInToDbCount)
-					//goTx.Commit()
-					semaphore <- stepTwoPointOneInToDbCount
-					runtime.GC()
-				}(userGoExecList, semaphore, lock)
-				userGoExecCount++
-				//userInc = 0
-				userGoExecList = nil
+				}
 			}
 		}
-		//var itemCountMap map[string]int64
-		completeCount := 0
-	loop:
-		for {
-			v, _ := <-semaphore
-			completeCount++
-			stepTwoPointOneInToDbTotal += v
-			fmt.Printf("step 2-1 入库 tianchi_fresh_comp_train_kv_step_two_point_one 总量 %d  \n", stepTwoPointOneInToDbTotal)
-			runtime.GC()
-			if completeCount >= userGoExecCount {
-				break loop
-			}
-		}
-
-		fmt.Println("step 2-1 入库 tianchi_fresh_comp_train_kv_step_two_point_one 完成", )
-
-		//step 2-2
-		Tx := Gdb.Begin()
-		Tx.Raw("INSERT INTO tianchi_fresh_comp_train_kv_step_two_point_two (`key`, `value`) SELECT `key` , SUM(`value`) FROM  tianchi_fresh_comp_train_kv_step_two_point_one GROUP BY `key`")
-		Tx.Commit()
-		fmt.Println("step 2-2 入库 tianchi_fresh_comp_train_kv_step_two_point_two 完成", )
+		fmt.Printf("step 2-1 入库总量 %d  \n", stepTwoPointOneInToDbTotal)
 	}
 	fmt.Println("===============================  step 2 计算入库完成 -> levedb  ===============================")
 }
